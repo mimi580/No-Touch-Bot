@@ -192,12 +192,12 @@ class VolEngine:
             duration = self.cfg["dur_normal_ticks"]
 
         # Barrier placement — use current σ, not avg (more conservative)
-        barrier_dist = round(self.cfg["barrier_mult"] * s, 5)
-        # Ensure minimum barrier distance
+        barrier_dist = round(self.cfg["barrier_mult"] * s, 2)
+        # Ensure minimum barrier distance (2 dp)
         barrier_dist = max(barrier_dist, 0.05)
 
-        barrier_above = round(price + barrier_dist, 5)
-        barrier_below = round(price - barrier_dist, 5)
+        barrier_above = round(price + barrier_dist, 2)
+        barrier_below = round(price - barrier_dist, 2)
 
         return True, barrier_above, barrier_below, duration, s
 
@@ -422,14 +422,11 @@ class DerivClient:
         dist_below = abs(barrier_below - price) if price else barrier_below
 
         if dist_above >= dist_below:
-            barrier_str = f"+{barrier_above - price:.5f}"
+            barrier_offset = round(barrier_above - price, 2)
+            barrier_str = f"+{barrier_offset:.2f}"
         else:
-            barrier_str = f"-{price - barrier_below:.5f}"
-
-        # Round to reasonable precision
-        barrier_val = float(f"{float(barrier_str):.4f}")
-        barrier_str = (f"+{barrier_val:.4f}" if barrier_val >= 0
-                       else f"{barrier_val:.4f}")
+            barrier_offset = round(price - barrier_below, 2)
+            barrier_str = f"-{barrier_offset:.2f}"
 
         proposal_req = {
             "proposal":      1,
