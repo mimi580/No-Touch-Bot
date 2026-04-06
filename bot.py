@@ -87,6 +87,10 @@ CONFIG = {
     # Cooldown between trades (ticks)
     "cooldown_ticks":     _env("COOLDOWN_TICKS", 5),
 
+    # Directional momentum for barrier placement
+    "momentum_window":    _env("MOMENTUM_WINDOW", 10),   # last N ticks
+    "momentum_threshold": _env("MOMENTUM_THRESH", 0.05), # net drift to count as directional
+
     # Risk / Martingale
     "initial_stake":      _env("INITIAL_STAKE", 0.35),
     "martingale_mul":     _env("MARTINGALE_MUL", 1.50),
@@ -129,16 +133,19 @@ def _jlog(obj):
 
 class VolEngine:
     def __init__(self, cfg):
-        self.cfg      = cfg
-        self.prices   = deque(maxlen=cfg["vol_window"] + 2)
-        self.moves    = deque(maxlen=cfg["vol_window"])
-        self.tick_n   = 0
-        self.sigma_history = deque(maxlen=500)  # for session avg
+        self.cfg           = cfg
+        self.prices        = deque(maxlen=cfg["vol_window"] + 2)
+        self.moves         = deque(maxlen=cfg["vol_window"])
+        self.tick_n        = 0
+        self.sigma_history = deque(maxlen=500)
+        # Directional momentum: store raw signed moves
+        self.signed_moves  = deque(maxlen=cfg["momentum_window"])
 
     def add_tick(self, price: float):
         if self.prices:
-            move = abs(price - self.prices[-1])
-            self.moves.append(move)
+            raw  = price - self.prices[-1]
+            self.moves.append(abs(raw))
+            self.signed_moves.append(raw)
         self.prices.append(price)
         self.tick_n += 1
 
@@ -157,49 +164,76 @@ class VolEngine:
 
     def session_avg_sigma(self) -> float:
         if not self.sigma_history:
-            return 0.089   # fallback from monitor data
+            return 0.089
         return sum(self.sigma_history) / len(self.sigma_history)
 
     def current_price(self) -> Optional[float]:
         return self.prices[-1] if self.prices else None
 
+    def momentum_bias(self) -> str:
+        """
+        Returns 'UP', 'DOWN', or 'NEUTRAL' based on net direction
+        of the last momentum_window ticks.
+        UP   → price drifting up   → place barrier ABOVE (bet it won't go higher)
+        DOWN → price drifting down → place barrier BELOW (bet it won't go lower)
+        NEUTRAL → use geometric (further side)
+        """
+        if len(self.signed_moves) < self.cfg["momentum_window"]:
+            return "NEUTRAL"
+        net = sum(self.signed_moves)
+        threshold = self.cfg["momentum_threshold"]
+        if net > threshold:
+            return "UP"
+        if net < -threshold:
+            return "DOWN"
+        return "NEUTRAL"
+
     def evaluate(self):
         """
-        Returns (should_trade, barrier_above, barrier_below, duration, sigma)
-        or (False, ...) if conditions not met.
+        Returns (should_trade, barrier_str, duration, sigma, bias)
+        barrier_str: e.g. '+0.27' or '-0.31' — relative to current price.
         """
         if not self.is_ready():
-            return False, 0, 0, 0, 0
+            return False, "", 0, 0, "NEUTRAL"
 
         s     = self.sigma()
         avg   = self.session_avg_sigma()
         price = self.current_price()
 
         if price is None or avg == 0:
-            return False, 0, 0, 0, s
+            return False, "", 0, s, "NEUTRAL"
 
         ratio = s / avg if avg > 0 else 1.0
 
-        # Entry gate — only trade in calm windows
+        # Entry gate
         if ratio >= self.cfg["entry_sigma_ratio"]:
-            return False, 0, 0, 0, s
+            return False, "", 0, s, "NEUTRAL"
 
         # Adaptive duration
-        calm_thresh = self.cfg["dur_calm_threshold"]
-        if ratio < calm_thresh:
+        if ratio < self.cfg["dur_calm_threshold"]:
             duration = self.cfg["dur_calm_ticks"]
         else:
             duration = self.cfg["dur_normal_ticks"]
 
-        # Barrier placement — use current σ, not avg (more conservative)
+        # Barrier distance (2 dp max for Deriv)
         barrier_dist = round(self.cfg["barrier_mult"] * s, 2)
-        # Ensure minimum barrier distance (2 dp)
         barrier_dist = max(barrier_dist, 0.05)
 
-        barrier_above = round(price + barrier_dist, 2)
-        barrier_below = round(price - barrier_dist, 2)
+        # Directional bias — place barrier in the direction of momentum
+        # (bet the momentum won't continue far enough to touch it)
+        bias = self.momentum_bias()
 
-        return True, barrier_above, barrier_below, duration, s
+        if bias == "UP":
+            # Trending up → place barrier above, bet it won't spike further
+            barrier_str = f"+{barrier_dist:.2f}"
+        elif bias == "DOWN":
+            # Trending down → place barrier below, bet it won't drop further
+            barrier_str = f"-{barrier_dist:.2f}"
+        else:
+            # Neutral — use the safer side (larger distance from price)
+            barrier_str = f"+{barrier_dist:.2f}"
+
+        return True, barrier_str, duration, s, bias
 
 
 # ============================================================================
@@ -403,31 +437,13 @@ class DerivClient:
         return True
 
     async def place_notouch(
-            self, barrier_above: float, barrier_below: float,
+            self, barrier_str: str,
             duration: int, stake: float) -> Optional[str]:
         """
-        Place two simultaneous No Touch contracts:
-          · NOTOUCH above: win if price never reaches barrier_above
-          · NOTOUCH below: win if price never reaches barrier_below
-        Only places the one with better expected probability — the
-        direction further from current price.
-        Actually for NOTOUCH we place both and collect both payouts.
-        Deriv NOTOUCH requires a single barrier (not double), so we
-        choose the barrier further from price for maximum safety.
+        Place a NOTOUCH contract with a pre-computed relative barrier string.
+        barrier_str examples: '+0.27', '-0.31'
+        Direction is chosen by the VolEngine based on momentum bias.
         """
-        price = self.cfg.get("_last_price", 0)
-
-        # Choose the safer barrier (further from price)
-        dist_above = abs(barrier_above - price) if price else barrier_above
-        dist_below = abs(barrier_below - price) if price else barrier_below
-
-        if dist_above >= dist_below:
-            barrier_offset = round(barrier_above - price, 2)
-            barrier_str = f"+{barrier_offset:.2f}"
-        else:
-            barrier_offset = round(price - barrier_below, 2)
-            barrier_str = f"-{barrier_offset:.2f}"
-
         proposal_req = {
             "proposal":      1,
             "amount":        stake,
@@ -653,13 +669,13 @@ class NoTouchBot:
         if self.waiting_for_result:
             return
 
-        ok, b_above, b_below, duration, sigma = self.engine.evaluate()
+        ok, barrier_str, duration, sigma, bias = self.engine.evaluate()
         avg = self.engine.session_avg_sigma()
 
         print(f"\n{'='*55}", flush=True)
         print(f"SIGNAL  #{self.tick_n}  {_ts()}", flush=True)
-        print(f"  σ={sigma:.6f}  avg={avg:.6f}  "
-              f"ratio={sigma/avg:.2f}" if avg > 0 else f"  σ={sigma:.6f}",
+        ratio_str = f"{sigma/avg:.2f}" if avg > 0 else "?"
+        print(f"  σ={sigma:.6f}  avg={avg:.6f}  ratio={ratio_str}  bias={bias}",
               flush=True)
 
         if not ok:
@@ -667,8 +683,8 @@ class NoTouchBot:
             print(f"{'='*55}", flush=True)
             return
 
-        print(f"  → NOTOUCH  barrier±{self.cfg['barrier_mult']}×σ  "
-              f"duration={duration}t", flush=True)
+        print(f"  → NOTOUCH  barrier={barrier_str}  "
+              f"duration={duration}t  bias={bias}", flush=True)
         print(f"{'='*55}", flush=True)
 
         now = time.monotonic()
@@ -690,7 +706,7 @@ class NoTouchBot:
             self._balance_before = None
 
         contract_id = await self.client.place_notouch(
-            b_above, b_below, duration, stake)
+            barrier_str, duration, stake)
 
         if contract_id:
             self.current_contract = {
@@ -698,6 +714,8 @@ class NoTouchBot:
                 "stake":    stake,
                 "duration": duration,
                 "sigma":    sigma,
+                "bias":     bias,
+                "barrier":  barrier_str,
                 "time":     datetime.now(),
             }
             self.waiting_for_result = True
@@ -705,10 +723,14 @@ class NoTouchBot:
             self._last_trade_tick   = self.tick_n
             _log("LOCK", f"Waiting for result on {contract_id}")
             _jlog({
-                "type": "trade", "cid": contract_id,
-                "duration": duration, "stake": stake,
-                "sigma": round(sigma, 6), "barrier_mult": self.cfg["barrier_mult"],
-                "ts": _ts(),
+                "type":    "trade",
+                "cid":     contract_id,
+                "duration": duration,
+                "stake":   stake,
+                "sigma":   round(sigma, 6),
+                "barrier": barrier_str,
+                "bias":    bias,
+                "ts":      _ts(),
             })
         else:
             self._balance_before = None
